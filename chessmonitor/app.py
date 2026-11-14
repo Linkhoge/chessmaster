@@ -19,7 +19,7 @@ class App:
 
     def __init__(self, root):
         self.root = root; root.title('ChessMaster')
-        root.geometry('430x580'); root.minsize(400, 420); root.configure(bg=self.BG)
+        root.geometry('430x600'); root.minsize(400, 440); root.configure(bg=self.BG)
         try: root.attributes('-topmost', True)
         except Exception: pass
         self.board = chess.Board(); self.position_confirmed = False
@@ -39,7 +39,7 @@ class App:
         self.vision = BoardVision(os.path.join(BASE, 'vision_templates.npz'))
         self.engine = UCIEngine(self.stock_path.get()); self.maia = Maia3()
         self.board_rect = None; self.player_orientation = None; self.last_scan = 0
-        self._busy = False; self._scanning = False; self._lost = 0; self._sync_n = 0
+        self._busy = False; self._scanning = False; self._lost = 0; self._sync_n = 0; self._miss_n = 0
         self._pending_key = None; self._pending_n = 0; self._turn_unsure = False; self._analysed_fen = None
         self._vision_lock = threading.Lock(); self._calibrated_for_start = False; self._opening_gap = 0
         self._style(); self._ui(); self._start_automatic_monitor()
@@ -95,6 +95,7 @@ class App:
         ttk.Button(row, text='Analyse', style='Accent.TButton', command=self.analyse_async).pack(side='right')
         ttk.Button(row, text='Calibrate', command=self.recalibrate_now).pack(side='right', padx=(0, 6))
         self.detect_label = ttk.Label(coach, text='Looking for a board', style='Muted.TLabel'); self.detect_label.pack(anchor='w', pady=(4, 0))
+        self.debug_label = ttk.Label(coach, text='Scanner: starting', style='Muted.TLabel', wraplength=380, justify='left'); self.debug_label.pack(anchor='w', pady=(2, 0))
         self.toggles = ttk.Frame(coach, style=P); self.toggles.pack(fill='x', pady=(6, 0))
         ttk.Checkbutton(self.toggles, text='Auto coach', variable=self.auto_coach).pack(side='left')
         ttk.Checkbutton(self.toggles, text='Preview', variable=self.show_preview, command=self._resize).pack(side='left', padx=10)
@@ -136,12 +137,15 @@ class App:
         self.output.insert('end', 'Ready. Open your chess game, pick its window above and press Use. ChessMaster follows the game on its own, and suggests a move whenever it is your turn.')
         self.output.configure(state='disabled')
 
+    def _dbg(self, text):
+        self.root.after(0, lambda t=text: self.debug_label.configure(text='Scanner: ' + t))
+
     def _resize(self):
         if self.show_preview.get(): self.monitor.pack(fill='x', pady=(0, 8), before=self.coach_card)
         else: self.monitor.pack_forget()
         if self.show_settings.get(): self.settings.pack(fill='x', pady=(8, 0), after=self.toggles)
         else: self.settings.pack_forget()
-        h = 580 + (200 if self.show_settings.get() else 0) + (240 if self.show_preview.get() else 0)
+        h = 600 + (200 if self.show_settings.get() else 0) + (240 if self.show_preview.get() else 0)
         self.root.geometry('430x' + str(h))
 
     def refresh_windows(self):
@@ -160,7 +164,7 @@ class App:
         self.capture.stop(); self.capture.set_target(title, hwnd)
         self.capture.latest = None; self.board_rect = None; self.position_confirmed = False
         self.board = chess.Board(); self.player_orientation = None; self._turn_unsure = False
-        self._pending_key = None; self._pending_n = 0; self._sync_n = 0
+        self._pending_key = None; self._pending_n = 0; self._sync_n = 0; self._miss_n = 0
         self.overlay.hide()
         with self._vision_lock:
             self._calibrated_for_start = False; self._opening_gap = 0
@@ -241,13 +245,23 @@ class App:
                 self.last_scan = time.time(); self._scanning = True
                 threading.Thread(target=self._vision_worker, args=(frame.copy(),), daemon=True).start()
             if self.capture.error: self.status.configure(text='Capture error: ' + self.capture.error)
+        else:
+            self._dbg('Stage 0: no frames captured yet - pick the game window and press Use')
         self.root.after(150, self._tick)
 
     def _vision_worker(self, frame):
         try: self._scan(frame)
         except Exception as e:
-            self.root.after(0, lambda m=str(e): self.status.configure(text='Scan error: ' + m))
+            self._dbg('ERROR ' + type(e).__name__ + ': ' + str(e))
         finally: self._scanning = False
+
+    def _resync_ok(self, d):
+        cur = self.board.piece_map(); new = d.piece_map()
+        drop = len(cur) - len(new)
+        if drop < 0 or drop > 2: return False
+        for colour in (chess.WHITE, chess.BLACK):
+            if sum(1 for p in new.values() if p.color == colour) > sum(1 for p in cur.values() if p.color == colour): return False
+        return True
 
     def _scan(self, frame):
         loc = locate_chessboard(frame)
@@ -256,6 +270,7 @@ class App:
                 self._opening_gap += 1
                 if self._opening_gap >= 3: self._calibrated_for_start = False
             self._lost += 1
+            self._dbg('Stage 1: no board found in the captured window (' + str(self._lost) + ')')
             if self._lost >= 3: self.root.after(0, self._board_lost)
             return
         self._lost = 0
@@ -278,22 +293,37 @@ class App:
             self.root.after(0, lambda r=rect, o=guessed: self._finish_autocalibration(r, o)); return
         orient = self.player_orientation if (self.position_confirmed and self.player_orientation) else guessed
         self.root.after(0, lambda r=rect, o=orient: self._board_found(r, o))
-        if not self.vision.ready() or orient is None: return
+        if not self.vision.ready():
+            self._dbg('Stage 2: only ' + str(len(self.vision.templates)) + '/14 piece templates. Press Calibrate on a fresh start-position board, or use Label squares.')
+            return
+        if orient is None:
+            self._dbg('Stage 2: cannot tell which colour is at the bottom of the board')
+            return
         res = self.vision.square_scores(crop)
-        if res is None: return
+        if res is None:
+            self._dbg('Stage 3: board crop too small'); return
         labels, S = res
         conf = float(S.reshape(64, -1).max(axis=1).mean())
-        if conf < 0.55: return
         detected = board_from_scores(S, labels, orient)
+        n = len(detected.piece_map())
+        info = 'match ' + format(conf, '.2f') + ', ' + str(n) + ' pieces seen'
+        if conf < 0.4:
+            self._dbg('Stage 3: poor ' + info + '. The board looks unlike the templates (new theme?). Press Calibrate on a start position.'); return
         if detected.piece_map() == chess.Board().piece_map():
-            self._pending_key = None; self._pending_n = 0
+            self._pending_key = None; self._pending_n = 0; self._miss_n = 0
+            self._dbg('Start position seen - ' + info)
             self.root.after(0, lambda o=orient, s=conf: self._accept_initial_position(o, s)); return
         if not self.position_confirmed:
             self._sync_n += 1
-            if self._sync_n >= 2 and conf >= 0.7:
+            self._dbg('Stage 4: reading the position - ' + info + ' (' + str(self._sync_n) + '/2)')
+            if self._sync_n >= 2 and conf >= 0.6:
                 self.root.after(0, lambda b=detected, o=orient, c=conf: self._sync_from_screen(b, o, c))
             return
         self._sync_n = 0
+        if detected.board_fen() == self.board.board_fen():
+            self._pending_key = None; self._pending_n = 0; self._miss_n = 0
+            self._dbg('Tracking live - in sync - ' + info)
+            return
         with self._vision_lock: board = self.board.copy(stack=False)
         opts = [board]
         if self._turn_unsure:
@@ -303,16 +333,24 @@ class App:
             r = best_transition(b, S, labels, orient)
             if r and (best is None or r[1] > best[1][1]): best = (b, r)
         if not best:
-            self._pending_key = None; self._pending_n = 0; return
+            self._pending_key = None; self._pending_n = 0
+            self._miss_n += 1
+            self._dbg('Tracking - screen differs from my board but no single clear move (' + str(self._miss_n) + '/4) - ' + info)
+            if self._miss_n >= 4 and conf >= 0.6 and self._resync_ok(detected):
+                self._miss_n = 0
+                self.root.after(0, lambda b=detected, o=orient: self._resync(b, o))
+            return
+        self._miss_n = 0
         base, (path, gain) = best
         key = (base.board_fen(), base.turn, tuple(m.uci() for m in path))
         if key == self._pending_key: self._pending_n += 1
         else: self._pending_key = key; self._pending_n = 1
+        self._dbg('Move seen: ' + ' '.join(m.uci() for m in path) + ' (gain ' + format(gain, '.2f') + ', confirm ' + str(self._pending_n) + '/2) - ' + info)
         if self._pending_n < 2: return
         self._pending_key = None; self._pending_n = 0
         after = base.copy(stack=False)
         for m in path: after.push(m)
-        if conf >= 0.7: self.vision.learn(crop, expected_labels(after, orient), S, labels)
+        if conf >= 0.6: self.vision.learn(crop, expected_labels(after, orient), S, labels)
         self.root.after(0, lambda pl=base.board_fen(), t=base.turn, p=path, c=conf, o=orient: self._accept_moves(pl, t, p, c, o))
 
     def _board_lost(self):
@@ -352,11 +390,23 @@ class App:
         b.turn = self._player_colour(orient)
         b.castling_rights = guess_castling(b)
         if not b.is_valid():
-            self.status.configure(text='Reading the position... (waiting for a clean view of both kings)'); return
+            self.status.configure(text='Reading the position... (waiting for a clean view of both kings)')
+            self._dbg('Stage 4: position read but not a legal chess position (kings/pawns misread?) - ' + b.board_fen())
+            return
         self.board = b; self.position_confirmed = True; self._turn_unsure = True
         self.player_orientation = orient
         self.side_value.configure(text=self._side_text(orient))
         self.status.configure(text='Joined mid-game from the screen \u00b7 assuming it is your move')
+        if self.auto_coach.get(): self.analyse_async(auto=True)
+
+    def _resync(self, d, orient):
+        if not self.position_confirmed: return
+        d.turn = self._player_colour(orient)
+        d.castling_rights = guess_castling(d)
+        if not d.is_valid(): return
+        self.board = d; self._turn_unsure = True; self._pending_key = None; self._pending_n = 0
+        self.overlay.hide(); self.chosen = None
+        self.status.configure(text='Lost track - re-read the board from the screen \u00b7 assuming it is your move')
         if self.auto_coach.get(): self.analyse_async(auto=True)
 
     def _accept_moves(self, placement, turn, path, conf, orient):
@@ -381,7 +431,7 @@ class App:
         if self._busy: return
         if not self.position_confirmed:
             self.output.configure(state='normal'); self.output.delete('1.0', 'end')
-            self.output.insert('end', 'Position not read yet. Make sure the whole board is visible. If this is a new game, it starts on its own; for a game in progress, give it a second or two.')
+            self.output.insert('end', 'Position not read yet. Make sure the whole board is visible. If this is a new game, it starts on its own; for a game in progress, give it a second or two. The Scanner line above says which step it is stuck on.')
             self.output.configure(state='disabled')
             self.status.configure(text='Board located - waiting for verified piece recognition'); return
         self._busy = True; pos = self.board.copy(); self._analysed_fen = pos.fen()
