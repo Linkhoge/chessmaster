@@ -1,0 +1,9 @@
+# Optional: removes the "unauthenticated requests to the HF Hub" warning
+# and gives faster, higher-limit model downloads.
+#
+# 1. Make a free account at https://huggingface.co and confirm your email.
+# 2. Go to https://huggingface.co/settings/tokens and create a token with Read access.
+# 3. Copy this file to hf_token.txt (same folder as main.py).
+# 4. Replace everything below the comments with your token (starts with hf_).
+#
+# hf_token.txt is git-ignored, so your token never gets uploaded.
