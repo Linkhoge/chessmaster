@@ -3,6 +3,7 @@ import os, cv2, numpy as np, chess
 SYMBOLS = list('PNBRQKpnbrqk')
 EMPTY_LIGHT = '.L'
 EMPTY_DARK = '.D'
+OCC_STD = 18.0
 
 class BoardVision:
     '''Template-based recognizer for a calibrated, fixed-size 2D board crop.'''
@@ -128,13 +129,19 @@ class BoardVision:
         self._dirty = False
 
     def square_scores(self, frame_rgb):
-        '''Return (labels, S) where S[row, col, k] is the best similarity of that square to label k.'''
+        '''Return (labels, S) where S[row, col, k] says how well square (row, col) matches label k.
+
+        Whether a square is occupied is decided by pixel variance (an empty square is one flat colour,
+        however it is highlighted). Template matching is then used only to tell WHICH piece sits there.
+        '''
         if self._dirty: self._stack()
         if self._mat is None: return None
         bgr = cv2.cvtColor(np.array(frame_rgb), cv2.COLOR_RGB2BGR)
         h, w = bgr.shape[:2]
         if w < 160 or h < 160: return None
-        P = np.stack([self._patch(bgr, c, r).astype(np.float32).reshape(-1) for r in range(8) for c in range(8)])
+        patches = [self._patch(bgr, c, r).astype(np.float32) for r in range(8) for c in range(8)]
+        occupied = np.array([p[..., 0].std() > OCC_STD for p in patches])
+        P = np.stack([p.reshape(-1) for p in patches])
         P = P - P.mean(axis=1, keepdims=True)
         P = P / (np.linalg.norm(P, axis=1, keepdims=True) + 1e-6)
         sims = P @ self._mat.T
@@ -142,15 +149,25 @@ class BoardVision:
         S = np.full((64, K), -1.0, np.float32)
         for k in range(K):
             S[:, k] = sims[:, self._label_idx == k].max(axis=1)
-        return list(self._label_list), S.reshape(8, 8, K)
+        labels = list(self._label_list)
+        empty_cols = [k for k, l in enumerate(labels) if l in (EMPTY_LIGHT, EMPTY_DARK)]
+        piece_cols = [k for k, l in enumerate(labels) if l not in (EMPTY_LIGHT, EMPTY_DARK)]
+        for n in range(64):
+            if occupied[n]:
+                S[n, empty_cols] = 0.0
+                S[n, piece_cols] = np.maximum(S[n, piece_cols], 0.0)
+            else:
+                S[n, piece_cols] = 0.0
+                S[n, empty_cols] = 0.95
+        return labels, S.reshape(8, 8, K)
 
     def learn(self, frame_rgb, expected, S, labels, max_per=10):
-        '''Add new looks (highlighted squares, themes) for squares we are fairly sure about. Memory only.'''
+        '''Add new looks (highlighted squares, themes) for pieces we are fairly sure about. Memory only.'''
         bgr = cv2.cvtColor(np.array(frame_rgb), cv2.COLOR_RGB2BGR)
         idx = {l: i for i, l in enumerate(labels)}
         S2 = S.reshape(64, -1)
         for n, lab in enumerate(expected):
-            if lab not in idx: continue
+            if lab in (EMPTY_LIGHT, EMPTY_DARK) or lab not in idx: continue
             s = float(S2[n, idx[lab]])
             if 0.45 <= s < 0.93:
                 r, c = divmod(n, 8)
